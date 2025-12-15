@@ -19,10 +19,11 @@ var (
 // PluginConfig holds the configuration for the plugin
 type PluginConfig struct {
 	SplunkURL          string
-	SplunkIndex        string
+	SplunkIndex        string // Default index if not specified in pod labels
 	SecretLabelKey     string
+	IndexLabelKey      string // Pod label key for Splunk index
 	SecretNamespace    string
-	SecretKey          string
+	SecretKey          string // Fixed key name in Kubernetes secret
 	InsecureSkipVerify bool
 	CacheTTL           time.Duration
 	MaxRetries         int
@@ -71,7 +72,7 @@ type LogBatcher struct {
 	plugin       *K8sSplunkPlugin
 }
 
-// Batch holds logs for a specific token
+// Batch holds logs for a specific token (events can have different indexes)
 type Batch struct {
 	token      string
 	events     []SplunkEvent
@@ -195,7 +196,8 @@ func (b *LogBatcher) flushBatch(token string) error {
 		return nil
 	}
 
-	log.Printf("[k8s_splunk] Flushing batch: %d events for token %s", len(events), token[:10]+"...")
+	log.Printf("[k8s_splunk] Flushing batch: %d events for token %s...",
+		len(events), token[:10]+"...")
 
 	// Retry logic for batch
 	var lastErr error
@@ -269,6 +271,7 @@ func FLBPluginInit(ctx unsafe.Pointer) int {
 		SplunkURL:       output.FLBPluginConfigKey(ctx, "splunk_url"),
 		SplunkIndex:     output.FLBPluginConfigKey(ctx, "splunk_index"),
 		SecretLabelKey:  output.FLBPluginConfigKey(ctx, "secret_label_key"),
+		IndexLabelKey:   output.FLBPluginConfigKey(ctx, "index_label_key"),
 		SecretNamespace: output.FLBPluginConfigKey(ctx, "secret_namespace"),
 		SecretKey:       output.FLBPluginConfigKey(ctx, "secret_key"),
 		CacheTTL:        time.Hour,
@@ -292,7 +295,11 @@ func FLBPluginInit(ctx unsafe.Pointer) int {
 	}
 
 	if config.SecretKey == "" {
-		config.SecretKey = "token"
+		config.SecretKey = "token" // Fixed key name in secret
+	}
+
+	if config.IndexLabelKey == "" {
+		config.IndexLabelKey = "splunk-index" // Default label key for index
 	}
 
 	// Initialize components
@@ -390,7 +397,7 @@ func (p *K8sSplunkPlugin) processRecordBatched(timestamp interface{}, record map
 		return fmt.Errorf("failed to extract Kubernetes metadata: %w", err)
 	}
 
-	// Get secret name
+	// Get secret name from pod labels
 	secretName, err := getSecretNameFromLabels(k8sMetadata, p.config.SecretLabelKey)
 	if err != nil {
 		return fmt.Errorf("failed to get secret name from labels: %w", err)
@@ -402,20 +409,26 @@ func (p *K8sSplunkPlugin) processRecordBatched(timestamp interface{}, record map
 		return fmt.Errorf("failed to get Splunk token: %w", err)
 	}
 
+	// Get index from pod labels (or use default)
+	index := p.config.SplunkIndex // Default
+	if indexLabel, ok := k8sMetadata.Labels[p.config.IndexLabelKey]; ok && indexLabel != "" {
+		index = indexLabel // Override with pod label
+	}
+
 	// Convert to JSON-serializable format
 	jsonRecord := convertToStringMap(record)
 
-	// Create event
+	// Create event with index (Splunk HEC supports per-event index)
 	event := SplunkEvent{
 		Time:       p.splunkClient.formatTimestamp(timestamp),
 		Event:      jsonRecord,
-		Index:      p.config.SplunkIndex,
+		Index:      index, // Per-event index (can differ within same batch)
 		Host:       k8sMetadata.PodName,
 		Source:     fmt.Sprintf("%s/%s", k8sMetadata.Namespace, k8sMetadata.PodName),
 		SourceType: "kubernetes:pod",
 	}
 
-	// Add to batch (will auto-flush when full)
+	// Batch by token only - events with different indexes can be in same batch
 	return p.batcher.Add(token, event)
 }
 
