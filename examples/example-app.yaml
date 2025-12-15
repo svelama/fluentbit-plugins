@@ -1,0 +1,90 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: app1
+  namespace: production
+  labels:
+    app: app1
+    # This label tells the plugin which secret contains the Splunk HEC token
+    splunk-token-secret: app1-splunk-token
+spec:
+  containers:
+  - name: app
+    image: busybox
+    command: ["sh", "-c"]
+    args:
+    - |
+      while true; do
+        echo "{\"timestamp\":\"$(date -Iseconds)\",\"level\":\"info\",\"message\":\"App1 is running\",\"app\":\"app1\"}"
+        sleep 5
+      done
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 100m
+        memory: 128Mi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: app2
+  namespace: production
+  labels:
+    app: app2
+    # This pod uses a different secret for a different Splunk token
+    splunk-token-secret: app2-splunk-token
+spec:
+  containers:
+  - name: app
+    image: busybox
+    command: ["sh", "-c"]
+    args:
+    - |
+      while true; do
+        echo "{\"timestamp\":\"$(date -Iseconds)\",\"level\":\"info\",\"message\":\"App2 is running\",\"app\":\"app2\"}"
+        sleep 5
+      done
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 100m
+        memory: 128Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+  namespace: production
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web-app
+  template:
+    metadata:
+      labels:
+        app: web-app
+        # All pods in this deployment will use the same secret
+        splunk-token-secret: app1-splunk-token
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi

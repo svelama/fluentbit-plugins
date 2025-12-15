@@ -1,0 +1,200 @@
+# Multi-Stage Pipeline for High Volume Log Processing
+# Use this for 50,000+ logs/sec scenarios
+
+---
+# Stage 1: Lightweight DaemonSet (on each node)
+# Collects logs and forwards to aggregator
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluent-bit-forwarder-config
+  namespace: logging
+data:
+  fluent-bit.conf: |
+    [SERVICE]
+        Flush               1
+        Log_Level           info
+        Daemon              Off
+
+    [INPUT]
+        Name                tail
+        Path                /var/log/containers/*.log
+        Parser              docker
+        Tag                 kube.*
+        Refresh_Interval    5
+        Mem_Buf_Limit       5MB
+
+    [FILTER]
+        Name                kubernetes
+        Match               kube.*
+        Kube_URL            https://kubernetes.default.svc:443
+        Kube_CA_File        /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        Kube_Token_File     /var/run/secrets/kubernetes.io/serviceaccount/token
+        Merge_Log           On
+
+    # Forward to aggregator (NOT to Splunk directly)
+    [OUTPUT]
+        Name                forward
+        Match               *
+        Host                fluent-bit-aggregator
+        Port                24224
+        # No secret fetching here - just forward
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit-forwarder
+  namespace: logging
+spec:
+  selector:
+    matchLabels:
+      app: fluent-bit-forwarder
+  template:
+    metadata:
+      labels:
+        app: fluent-bit-forwarder
+    spec:
+      serviceAccountName: fluent-bit
+      containers:
+      - name: fluent-bit
+        image: fluent/fluent-bit:2.1
+        resources:
+          requests:
+            cpu: 100m      # Lightweight
+            memory: 128Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+        volumeMounts:
+        - name: varlog
+          mountPath: /var/log
+        - name: config
+          mountPath: /fluent-bit/etc/
+      volumes:
+      - name: varlog
+        hostPath:
+          path: /var/log
+      - name: config
+        configMap:
+          name: fluent-bit-forwarder-config
+---
+# Stage 2: Aggregator Deployment (can scale horizontally)
+# Receives logs from all nodes and sends to Splunk
+apiVersion: v1
+kind: Service
+metadata:
+  name: fluent-bit-aggregator
+  namespace: logging
+spec:
+  selector:
+    app: fluent-bit-aggregator
+  ports:
+  - port: 24224
+    targetPort: 24224
+    name: forward
+  type: ClusterIP
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluent-bit-aggregator-config
+  namespace: logging
+data:
+  fluent-bit.conf: |
+    [SERVICE]
+        Flush               5
+        Log_Level           info
+        Daemon              Off
+        Plugins_File        plugins.conf
+
+    # Receive logs from forwarders
+    [INPUT]
+        Name                forward
+        Port                24224
+
+    # Send to Splunk with your plugin
+    [OUTPUT]
+        Name                k8s_splunk
+        Match               *
+        splunk_url          ${SPLUNK_HEC_URL}
+        splunk_index        ${SPLUNK_INDEX}
+        secret_label_key    splunk-token-secret
+        secret_key          token
+
+  plugins.conf: |
+    [PLUGINS]
+        Path /fluent-bit/plugins/out_k8s_splunk.so
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fluent-bit-aggregator
+  namespace: logging
+spec:
+  # SCALE THIS based on load!
+  replicas: 3  # Can increase to 5, 10, 20+ if needed
+  selector:
+    matchLabels:
+      app: fluent-bit-aggregator
+  template:
+    metadata:
+      labels:
+        app: fluent-bit-aggregator
+    spec:
+      serviceAccountName: fluent-bit
+      containers:
+      - name: fluent-bit
+        image: your-registry/fluent-bit-k8s-splunk:latest
+        env:
+        - name: SPLUNK_HEC_URL
+          value: "https://splunk.example.com:8088/services/collector/event"
+        - name: SPLUNK_INDEX
+          value: "kubernetes"
+        resources:
+          requests:
+            cpu: 500m      # More powerful
+            memory: 512Mi
+          limits:
+            cpu: 2000m     # Can use more CPU
+            memory: 2Gi
+        volumeMounts:
+        - name: config
+          mountPath: /fluent-bit/etc/
+      volumes:
+      - name: config
+        configMap:
+          name: fluent-bit-aggregator-config
+---
+# Horizontal Pod Autoscaler for aggregator
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: fluent-bit-aggregator-hpa
+  namespace: logging
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: fluent-bit-aggregator
+  minReplicas: 3
+  maxReplicas: 20  # Scale up to 20 replicas if needed!
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 100  # Double replicas if needed
+        periodSeconds: 60
